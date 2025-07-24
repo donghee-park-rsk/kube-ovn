@@ -94,6 +94,14 @@ type VpcListerExpansion interface{}
 // VpcDnsLister.
 type VpcDnsListerExpansion interface{}
 
+// VpcEdgeRouterListerExpansion allows custom methods to be added to
+// VpcEdgeRouterLister.
+type VpcEdgeRouterListerExpansion interface{}
+
+// VpcEdgeRouterNamespaceListerExpansion allows custom methods to be added to
+// VpcEdgeRouterNamespaceLister.
+type VpcEdgeRouterNamespaceListerExpansion interface{}
+
 // VpcEgressGatewayListerExpansion allows custom methods to be added to
 // VpcEgressGatewayLister.
 type VpcEgressGatewayListerExpansion interface{}

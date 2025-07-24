@@ -104,6 +104,10 @@ func (c *FakeKubeovnV1) VpcDnses() v1.VpcDnsInterface {
 	return newFakeVpcDnses(c)
 }
 
+func (c *FakeKubeovnV1) VpcEdgeRouters(namespace string) v1.VpcEdgeRouterInterface {
+	return newFakeVpcEdgeRouters(c, namespace)
+}
+
 func (c *FakeKubeovnV1) VpcEgressGateways(namespace string) v1.VpcEgressGatewayInterface {
 	return newFakeVpcEgressGateways(c, namespace)
 }

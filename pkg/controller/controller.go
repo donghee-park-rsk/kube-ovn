@@ -290,6 +290,12 @@ type Controller struct {
 
 	// Database health check
 	dbFailureCount int
+
+	vpcEdgeRouterLister           kubeovnlister.VpcEdgeRouterLister
+	vpcEdgeRouterSynced           cache.InformerSynced
+	addOrUpdateVpcEdgeRouterQueue workqueue.TypedRateLimitingInterface[string]
+	delVpcEdgeRouterQueue         workqueue.TypedRateLimitingInterface[string]
+	vpcEdgeRouterKeyMutex         keymutex.KeyMutex
 }
 
 func newTypedRateLimitingQueue[T comparable](name string, rateLimiter workqueue.TypedRateLimiter[T]) workqueue.TypedRateLimitingInterface[T] {
@@ -350,6 +356,7 @@ func Run(ctx context.Context, config *Configuration) {
 	vpcInformer := kubeovnInformerFactory.Kubeovn().V1().Vpcs()
 	vpcNatGatewayInformer := kubeovnInformerFactory.Kubeovn().V1().VpcNatGateways()
 	vpcEgressGatewayInformer := kubeovnInformerFactory.Kubeovn().V1().VpcEgressGateways()
+	vpcEdgeRouterInformer := kubeovnInformerFactory.Kubeovn().V1().VpcEdgeRouters()
 	subnetInformer := kubeovnInformerFactory.Kubeovn().V1().Subnets()
 	ippoolInformer := kubeovnInformerFactory.Kubeovn().V1().IPPools()
 	ipInformer := kubeovnInformerFactory.Kubeovn().V1().IPs()
@@ -576,6 +583,12 @@ func Run(ctx context.Context, config *Configuration) {
 		deployInformerFactory:  deployInformerFactory,
 		kubeovnInformerFactory: kubeovnInformerFactory,
 		anpInformerFactory:     anpInformerFactory,
+
+		vpcEdgeRouterLister:           vpcEdgeRouterInformer.Lister(),
+		vpcEdgeRouterSynced:           vpcEdgeRouterInformer.Informer().HasSynced,
+		addOrUpdateVpcEdgeRouterQueue: newTypedRateLimitingQueue("AddOrUpdateVpcEdgeRouter", custCrdRateLimiter),
+		delVpcEdgeRouterQueue:         newTypedRateLimitingQueue("DeleteVpcEdgeRouter", custCrdRateLimiter),
+		vpcEdgeRouterKeyMutex:         keymutex.NewHashed(numKeyLocks),
 	}
 
 	if controller.OVNNbClient, err = ovs.NewOvnNbClient(
@@ -667,6 +680,7 @@ func Run(ctx context.Context, config *Configuration) {
 		controller.serviceSynced, controller.endpointSlicesSynced, controller.deploymentsSynced, controller.configMapsSynced,
 		controller.ovnEipSynced, controller.ovnFipSynced, controller.ovnSnatRuleSynced,
 		controller.ovnDnatRuleSynced,
+		controller.vpcEdgeRouterSynced,
 	}
 	if controller.config.EnableLb {
 		cacheSyncs = append(cacheSyncs, controller.switchLBRuleSynced, controller.vpcDNSSynced)
@@ -750,6 +764,14 @@ func Run(ctx context.Context, config *Configuration) {
 		DeleteFunc: controller.enqueueDeleteVpcEgressGateway,
 	}); err != nil {
 		util.LogFatalAndExit(err, "failed to add vpc egress gateway event handler")
+	}
+
+	if _, err = vpcEdgeRouterInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    controller.enqueueAddVpcEdgeRouter,
+		UpdateFunc: controller.enqueueUpdateVpcEdgeRouter,
+		DeleteFunc: controller.enqueueDeleteVpcEdgeRouter,
+	}); err != nil {
+		util.LogFatalAndExit(err, "failed to add vpc edge router event handler")
 	}
 
 	if _, err = subnetInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -1093,6 +1115,9 @@ func (c *Controller) shutdown() {
 	c.addOrUpdateVpcEgressGatewayQueue.ShutDown()
 	c.delVpcEgressGatewayQueue.ShutDown()
 
+	c.addOrUpdateVpcEdgeRouterQueue.ShutDown()
+	c.delVpcEdgeRouterQueue.ShutDown()
+
 	if c.config.EnableLb {
 		c.addSwitchLBRuleQueue.ShutDown()
 		c.delSwitchLBRuleQueue.ShutDown()
@@ -1186,6 +1211,8 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	go wait.Until(runWorker("delete vpc nat gateway", c.delVpcNatGatewayQueue, c.handleDelVpcNatGw), time.Second, ctx.Done())
 	go wait.Until(runWorker("add/update vpc egress gateway", c.addOrUpdateVpcEgressGatewayQueue, c.handleAddOrUpdateVpcEgressGateway), time.Second, ctx.Done())
 	go wait.Until(runWorker("delete vpc egress gateway", c.delVpcEgressGatewayQueue, c.handleDelVpcEgressGateway), time.Second, ctx.Done())
+	go wait.Until(runWorker("add/update vpc edge router", c.addOrUpdateVpcEdgeRouterQueue, c.handleAddOrUpdateVpcEdgeRouter), time.Second, ctx.Done())
+	go wait.Until(runWorker("delete vpc edge router", c.delVpcEdgeRouterQueue, c.handleDelVpcEdgeRouter), time.Second, ctx.Done())
 	go wait.Until(runWorker("update fip for vpc nat gateway", c.updateVpcFloatingIPQueue, c.handleUpdateVpcFloatingIP), time.Second, ctx.Done())
 	go wait.Until(runWorker("update eip for vpc nat gateway", c.updateVpcEipQueue, c.handleUpdateVpcEip), time.Second, ctx.Done())
 	go wait.Until(runWorker("update dnat for vpc nat gateway", c.updateVpcDnatQueue, c.handleUpdateVpcDnat), time.Second, ctx.Done())

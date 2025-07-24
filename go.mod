@@ -1,6 +1,8 @@
 module github.com/kubeovn/kube-ovn
 
-go 1.24.5
+go 1.24.3
+
+toolchain go1.24.5
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
