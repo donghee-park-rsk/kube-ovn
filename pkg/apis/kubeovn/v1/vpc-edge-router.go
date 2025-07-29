@@ -57,6 +57,7 @@ type BGPConfig struct {
 	Password              string          `json:"password,omitempty"`
 	EnableGracefulRestart bool            `json:"enableGracefulRestart,omitempty"`
 	ExtraArgs             []string        `json:"extraArgs,omitempty"`
+	AdvertisedRoutes      []string        `json:"advertisedRoutes,omitempty"`
 }
 
 // VPCEdgeRouterStatus BGP status

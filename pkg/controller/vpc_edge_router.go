@@ -224,6 +224,24 @@ func (c *Controller) reconcileVpcEdgeRouterBGP(router *kubeovnv1.VpcEdgeRouter) 
 		args = append(args, "--neighbor-ipv6-address="+strings.Join(neighIPv6, ","))
 	}
 
+	var advertiseIPv4, advertiseIPv6 []string
+	for _, advertisedRoutes := range router.Spec.BGP.AdvertisedRoutes {
+		switch util.CheckProtocol(advertisedRoutes) {
+		case kubeovnv1.ProtocolIPv4:
+			advertiseIPv4 = append(advertiseIPv4, advertisedRoutes)
+		case kubeovnv1.ProtocolIPv6:
+			advertiseIPv6 = append(advertiseIPv6, advertisedRoutes)
+		default:
+			return fmt.Errorf("unsupported protocol for peer %s", advertisedRoutes)
+		}
+	}
+	if len(advertiseIPv4) > 0 {
+		args = append(args, "--advertised-routes="+strings.Join(advertiseIPv4, ","))
+	}
+	if len(advertiseIPv6) > 0 {
+		args = append(args, "--advertised-ipv6-routes="+strings.Join(advertiseIPv6, ","))
+	}
+
 	for _, parent := range router.Spec.ParentRefs {
 		ns := parent.Namespace
 		if ns == "" {

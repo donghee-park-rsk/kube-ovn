@@ -1332,6 +1332,14 @@ spec:
                     type: array
                     items:
                       type: string
+                  advertisedRoutes:
+                    type: array
+                    items:
+                      type: string
+                      # anyOf:
+                      # - format: ipv4
+                      # - format: ipv6
+                      # - pattern: '^$'
           # status:
           #   type: object
           #   properties:

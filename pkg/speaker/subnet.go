@@ -20,6 +20,8 @@ const (
 	// them. In other words, traffic will only enter from nodes hosting Pods marked as needing BGP advertisement,
 	// or Pods with an IP belonging to a Subnet marked as needing BGP advertisement. This makes the network path shorter.
 	announcePolicyLocal = "local"
+	// announceEdgeRouter makes the Pod IPs/Subnet CIDRs be announced only from the edge router
+	announcePolicyEdgeRouter = "edge-router"
 )
 
 func (c *Controller) syncSubnetRoutes() {
@@ -106,6 +108,60 @@ func (c *Controller) syncSubnetRoutes() {
 					if util.CIDRContainIP(cidrBlock, podIP.IP) {
 						ips[util.CheckProtocol(podIP.IP)] = podIP.IP
 					}
+				}
+			}
+		}
+
+		for _, ip := range ips {
+			addExpectedPrefix(ip, bgpExpected)
+		}
+	}
+
+	if err := c.reconcileRoutes(bgpExpected); err != nil {
+		klog.Errorf("failed to reconcile routes: %s", err.Error())
+	}
+}
+
+func (c *Controller) syncERSubnetRoutes() {
+	bgpExpected := make(prefixMap)
+
+	subnets, err := c.subnetsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list subnets, %v", err)
+		return
+	}
+	pods, err := c.podsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list pods, %v", err)
+		return
+	}
+
+	for _, subnet := range subnets {
+		if subnet.Status.IsReady() && subnet.Annotations != nil {
+			ips := strings.Split(subnet.Spec.CIDRBlock, ",")
+			policy := subnet.Annotations[util.BgpAnnotation]
+			if policy == "" {
+				continue
+			}
+			if policy == announcePolicyEdgeRouter {
+				for _, cidr := range ips {
+					ipFamily := util.CheckProtocol(cidr)
+					bgpExpected[ipFamily] = append(bgpExpected[ipFamily], cidr)
+				}
+			}
+		}
+	}
+
+	for _, pod := range pods {
+		if pod.Spec.HostNetwork || pod.Status.PodIP == "" || len(pod.Annotations) == 0 || !isPodAlive(pod) {
+			continue
+		}
+
+		ips := make(map[string]string, 2)
+		if policy := pod.Annotations[util.BgpAnnotation]; policy != "" {
+			if policy == announcePolicyEdgeRouter {
+				for _, podIP := range pod.Status.PodIPs {
+					ips[util.CheckProtocol(podIP.IP)] = podIP.IP
 				}
 			}
 		}

@@ -102,7 +102,7 @@ func (rs *RouteSyncer) DelInjectedRoute(dst *net.IPNet) {
 }
 
 // syncLocalRouteTable iterates over the local route state map and syncs all routes to the kernel's routing table
-func (rs *RouteSyncer) SyncLocalRouteTable() (*netlink.Route, error) {
+func (rs *RouteSyncer) syncLocalRouteTable() (*netlink.Route, error) {
 	rs.mutex.Lock()
 	defer rs.mutex.Unlock()
 	klog.Infof("Running local route table synchronization")
@@ -125,7 +125,13 @@ func (rs *RouteSyncer) Run(stopCh <-chan struct{}) {
 		for {
 			select {
 			case <-t.C:
-				_, err := rs.SyncLocalRouteTable()
+				// Sync what we have to announce
+				// _, err := rs.syncSubnetRoutes()
+				// if err != nil {
+				// 	klog.Errorf("failed to sync local subnet announce : %v", err)
+				// }
+
+				_, err := rs.syncLocalRouteTable()
 				if err != nil {
 					klog.Errorf("route could not be replaced due to: %v", err)
 				}
@@ -225,7 +231,7 @@ func (rs *RouteSyncer) injectRoute(path *gobgpapi.Path) error {
 	klog.Infof("Inject route: '%s via %s' from peer to routing table", dst, nextHop)
 	rs.AddInjectedRoute(dst, route)
 	// Immediately sync the local route table regardless of timer
-	_, syncLocalRouteTableErr := rs.SyncLocalRouteTable()
+	_, syncLocalRouteTableErr := rs.syncLocalRouteTable()
 	return syncLocalRouteTableErr
 }
 

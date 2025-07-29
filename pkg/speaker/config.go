@@ -25,6 +25,8 @@ import (
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	clientset "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned"
 	"github.com/kubeovn/kube-ovn/pkg/util"
+
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 const (
@@ -66,9 +68,10 @@ type Configuration struct {
 	KubeClient     kubernetes.Interface
 	KubeOvnClient  clientset.Interface
 
-	PprofPort      int32
-	LogPerm        string
-	EdgeRouterMode bool
+	PprofPort        int32
+	LogPerm          string
+	EdgeRouterMode   bool
+	AdvertisedRoutes []string // Routes to be advertised by the speaker
 }
 
 func ParseFlags() (*Configuration, error) {
@@ -97,6 +100,7 @@ func ParseFlags() (*Configuration, error) {
 		argEnableMetrics               = pflag.BoolP("enable-metrics", "", true, "Whether to support metrics query")
 		argLogPerm                     = pflag.String("log-perm", "640", "The permission for the log file")
 		argEdgeRouterMode              = pflag.BoolP("edge-router-mode", "", false, "Make the BGP speaker announce inside subnet and get routes from the outside, work as edge router")
+		argAdvertisedRoutes            = pflag.String("advertised-routes", "", "Comma separated list of CIDR blocks to advertise on BGP startup")
 	)
 	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
 	klog.InitFlags(klogFlags)
@@ -135,6 +139,18 @@ func ParseFlags() (*Configuration, error) {
 
 	nodeIPv4, nodeIPv6 := util.SplitStringIP(*argNodeIPs)
 
+	var advertisedRoutes []string
+	if *argAdvertisedRoutes != "" {
+		routes := strings.Split(*argAdvertisedRoutes, ",")
+		for _, route := range routes {
+			route = strings.TrimSpace(route)
+			if _, _, err := net.ParseCIDR(route); err != nil {
+				return nil, fmt.Errorf("invalid advertised route format: %s", route)
+			}
+		}
+		advertisedRoutes = routes
+	}
+
 	config := &Configuration{
 		AnnounceClusterIP: *argAnnounceClusterIP,
 		GrpcHost:          *argGrpcHost,
@@ -165,6 +181,7 @@ func ParseFlags() (*Configuration, error) {
 		EnableMetrics:               *argEnableMetrics,
 		LogPerm:                     *argLogPerm,
 		EdgeRouterMode:              *argEdgeRouterMode,
+		AdvertisedRoutes:            advertisedRoutes,
 	}
 
 	if *argNeighborAddress != "" {
@@ -307,6 +324,7 @@ func (config *Configuration) initBgpServer() error {
 	}); err != nil {
 		return err
 	}
+
 	for ipFamily, addresses := range peersMap {
 		for _, addr := range addresses {
 			peer := &api.Peer{
@@ -375,6 +393,11 @@ func (config *Configuration) initBgpServer() error {
 	}
 
 	config.BgpServer = s
+
+	if err := config.advertiseRoutes(); err != nil {
+		return fmt.Errorf("failed to advertise routes: %w", err)
+	}
+
 	return nil
 }
 
@@ -405,4 +428,82 @@ func GetExternalIP() (string, error) {
 	}
 
 	return "", errors.New("non–kube-ovn interface not found")
+}
+
+func (config *Configuration) advertiseRoutes() error {
+	if len(config.AdvertisedRoutes) == 0 {
+		return nil
+	}
+
+	for _, cidr := range config.AdvertisedRoutes {
+		klog.Infof("CIDR : %s", cidr)
+		if err := config.addRoute(cidr); err != nil {
+			klog.Errorf("Failed to advertise route %s: %v", cidr, err)
+			return err
+		}
+		klog.Infof("Successfully advertised route: %s", cidr)
+	}
+
+	return nil
+}
+
+// advertise routes by gobgp
+func (config *Configuration) addRoute(cidr string) error {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return fmt.Errorf("invalid CIDR %s: %w", cidr, err)
+	}
+
+	// Family & next-hop
+	family := &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST}
+
+	// Next hop will be external IP
+	nextHop, err := GetExternalIP()
+	if err != nil || nextHop == "" {
+		klog.Warningf("failed to get external IP: %v", err)
+		return err
+	}
+	if ipNet.IP.To4() == nil {
+		family = &api.Family{Afi: api.Family_AFI_IP6, Safi: api.Family_SAFI_UNICAST}
+	}
+
+	// NLRI
+	plen, _ := ipNet.Mask.Size()
+	if plen < 0 || plen > 128 {
+		return fmt.Errorf("prefix length %d out of range for %s", plen, cidr)
+	}
+	prefixLen := uint32(plen)
+
+	nlriMsg := &api.IPAddressPrefix{
+		Prefix:    ipNet.IP.String(),
+		PrefixLen: prefixLen,
+	}
+	nlriAny, _ := anypb.New(nlriMsg)
+
+	// Path-attributes
+	originAny, _ := anypb.New(&api.OriginAttribute{Origin: 0}) // IGP
+	pattrs := []*anypb.Any{originAny}
+
+	if family.Afi == api.Family_AFI_IP { // IPv4: NEXT_HOP
+		nhAny, _ := anypb.New(&api.NextHopAttribute{NextHop: nextHop})
+		pattrs = append(pattrs, nhAny)
+	} else { // IPv6: MP_REACH_NLRI
+		mpReach := &api.MpReachNLRIAttribute{
+			Family:   family,
+			NextHops: []string{nextHop},
+			Nlris:    []*anypb.Any{nlriAny},
+		}
+		mpAny, _ := anypb.New(mpReach)
+		pattrs = append(pattrs, mpAny)
+	}
+
+	// AddPath
+	_, err = config.BgpServer.AddPath(context.Background(), &api.AddPathRequest{
+		Path: &api.Path{
+			Family: family,
+			Nlri:   nlriAny,
+			Pattrs: pattrs,
+		},
+	})
+	return err
 }

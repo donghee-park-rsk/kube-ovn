@@ -108,6 +108,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	}
 
 	klog.Info("Started workers")
+
 	if c.config.EdgeRouterMode {
 		// Start route syncer work
 		// run every c.routerSyncer.injectedRoutesSyncPeriod
@@ -121,12 +122,15 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 }
 
 func (c *Controller) Reconcile() {
-	if c.config.NatGwMode {
+	switch {
+	case c.config.NatGwMode:
 		err := c.syncEIPRoutes()
 		if err != nil {
 			klog.Errorf("failed to reconcile EIPs: %s", err.Error())
 		}
-	} else {
+	case c.config.EdgeRouterMode:
+		c.syncERSubnetRoutes()
+	default:
 		c.syncSubnetRoutes()
 	}
 }

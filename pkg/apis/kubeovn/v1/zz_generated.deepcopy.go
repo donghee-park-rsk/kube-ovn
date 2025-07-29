@@ -99,6 +99,11 @@ func (in *BGPConfig) DeepCopyInto(out *BGPConfig) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.AdvertisedRoutes != nil {
+		in, out := &in.AdvertisedRoutes, &out.AdvertisedRoutes
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	return
 }
 
