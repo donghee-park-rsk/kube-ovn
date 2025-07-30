@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"slices"
 	"strings"
 
 	// "errors"
@@ -18,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
 	// "k8s.io/apimachinery/pkg/labels"
@@ -35,16 +38,20 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+const (
+	LastAppliedConfigAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
+)
+
 func (c *Controller) enqueueAddVpcEdgeRouter(obj any) {
 	key := cache.MetaObjectToName(obj.(*kubeovnv1.VpcEdgeRouter)).String()
 	klog.V(3).Infof("enqueue add vpc-edge-router %s", key)
-	c.addOrUpdateVpcEdgeRouterQueue.Add(key)
+	c.addVpcEdgeRouterQueue.Add(key)
 }
 
 func (c *Controller) enqueueUpdateVpcEdgeRouter(_, newObj any) {
 	key := cache.MetaObjectToName(newObj.(*kubeovnv1.VpcEdgeRouter)).String()
 	klog.V(3).Infof("enqueue update vpc-edge-router %s", key)
-	c.addOrUpdateVpcEdgeRouterQueue.Add(key)
+	c.updateVpcEdgeRouterQueue.Add(key)
 }
 
 func (c *Controller) enqueueDeleteVpcEdgeRouter(obj any) {
@@ -53,7 +60,7 @@ func (c *Controller) enqueueDeleteVpcEdgeRouter(obj any) {
 	c.delVpcEdgeRouterQueue.Add(key)
 }
 
-func (c *Controller) handleAddOrUpdateVpcEdgeRouter(key string) error {
+func (c *Controller) handleAddVpcEdgeRouter(key string) error {
 	ns, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
@@ -115,6 +122,292 @@ func (c *Controller) handleAddOrUpdateVpcEdgeRouter(key string) error {
 
 	klog.Infof("finished reconciling vpc-edge-router %s", key)
 
+	return nil
+}
+
+func (c *Controller) handleUpdateVpcEdgeRouter(key string) error {
+	// ---------------------------------------------------------------------
+	// 1. Retrieve latest object state from informer cache
+	// ---------------------------------------------------------------------
+	ns, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("invalid key %q: %w", key, err)
+	}
+
+	c.vpcEdgeRouterKeyMutex.LockKey(key)
+	defer func() { _ = c.vpcEdgeRouterKeyMutex.UnlockKey(key) }()
+
+	cachedRouter, err := c.vpcEdgeRouterLister.VpcEdgeRouters(ns).Get(name)
+	if err != nil {
+		// The object may have been deleted after being enqueued.
+		if k8serrors.IsNotFound(err) {
+			klog.Error(err)
+			return nil
+		}
+		return err // transient error → retry
+	}
+
+	if !cachedRouter.DeletionTimestamp.IsZero() {
+		c.delVpcEdgeRouterQueue.Add(key)
+		return nil
+	}
+	klog.Infof("reconciling vpc-edge-router %s", key)
+	// Deep copy because we might mutate Status below.
+	curRouter := cachedRouter.DeepCopy()
+
+	// ---------------------------------------------------------------------
+	// 2. Fetch a persisted snapshot of the *previous* spec
+	// ---------------------------------------------------------------------
+	// Robust techniques:
+	//   A. Store last-applied hash in cur.Status.ObservedGeneration or annotation
+	//   B. Maintain an in-memory cache (map[key]specHash) across reconciliations
+	//
+	// For simplicity we hash and compare against Status fields.
+	// ---------------------------------------------------------------------
+	// prevHash := curRouter.Status.LastObservedSpecHash // custom field you add to status
+	// newHash  := hashSpec(curRouter.Spec)              // any stable hash (FNV, xxhash, etc.)
+
+	// if prevHash == newHash {
+	//     // Nothing changed since we last processed; exit early (idempotent reconciliation)
+	//     return nil
+	// }
+
+	// ---------------------------------------------------------------------
+	// 3. Compute fine-grained diffs
+	// ---------------------------------------------------------------------
+	// Load the version we previously processed (you would usually unmarshall
+	// from an annotation or store in Status as JSON). Here we assume a helper:
+
+	var oldRouter kubeovnv1.VpcEdgeRouter
+	if err := json.Unmarshal([]byte(curRouter.GetAnnotations()[LastAppliedConfigAnnotation]), &oldRouter); err != nil {
+		return fmt.Errorf("failed to unmarshal last-applied-configuration: %w", err)
+	}
+	// routerIDChanged := oldRouter.Spec.BGP.RouterID != curRouter.Spec.BGP.RouterID
+	klog.Infof("old router advertised routes: %v", oldRouter.Spec.BGP.AdvertisedRoutes)
+	klog.Infof("current router advertised routes: %v", curRouter.Spec.BGP.AdvertisedRoutes)
+	// Check if advertised routes have changed
+	routesChanged := !slices.Equal(
+		oldRouter.Spec.BGP.AdvertisedRoutes,
+		curRouter.Spec.BGP.AdvertisedRoutes,
+	)
+
+	// ---------------------------------------------------------------------
+	// 4. Execute business logic based on the diff outcome
+	// ---------------------------------------------------------------------
+	// if routerIDChanged {
+	// 	if err := c.reconfigureRouterID(curRouter); err != nil {
+	// 		return err
+	// 	}
+	// }
+
+	if routesChanged {
+		if err := c.updateAdvertisedRoutes(curRouter, &oldRouter); err != nil {
+			return err
+		}
+	}
+
+	klog.Infof("finished reconciling vpc-edge-router %s", key)
+	return nil
+}
+
+// func (c *Controller) reconfigureRouterID(router *kubeovnv1.VpcEdgeRouter) error {
+// 	// 1. Validate new RouterID (must be valid IP, clash-free, etc.)
+// 	if net.ParseIP(router.Spec.BGP.RouterID) == nil {
+// 		return fmt.Errorf("invalid routerId %q", router.Spec.BGP.RouterID)
+// 	}
+
+// 	// // 2. Push config to BGP speaker (e.g., FRR, GoBGP)
+// 	// if err := c.bgpManager.SetRouterID(router.Namespace, router.Name, router.Spec.BGP.RouterID); err != nil {
+// 	// 	return err
+// 	// }
+
+// 	// // 3. Emit event
+// 	// c.recorder.Event(er, corev1.EventTypeNormal, "RouterIDUpdated",
+// 	// 	fmt.Sprintf("Set router-id=%s", er.Spec.Bgp.RouterId))
+
+// 	return nil
+// }
+
+func (c *Controller) updateAdvertisedRoutes(newRouter, oldRouter *kubeovnv1.VpcEdgeRouter) error {
+	newCidrs := newRouter.Spec.BGP.AdvertisedRoutes
+	oldCidrs := oldRouter.Spec.BGP.AdvertisedRoutes
+	klog.Infof("new cidrs: %v", newCidrs)
+	klog.Infof("old cidrs: %v", oldCidrs)
+
+	// Validate each CIDR
+	for _, cidr := range newCidrs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("malformed CIDR %q: %w", cidr, err)
+		}
+	}
+
+	routerPods, routerErr := c.getRouterPods(newRouter)
+	if routerErr != nil {
+		return fmt.Errorf("failed to get router pods for vpc-edge-router %s/%s: %w", newRouter.Namespace, newRouter.Name, routerErr)
+	}
+	if len(routerPods) == 0 {
+		return fmt.Errorf("no router pods found for vpc-edge-router %s/%s", newRouter.Namespace, newRouter.Name)
+	}
+	for _, routerPod := range routerPods {
+		if err := c.execUpdateBgpRoute(routerPod, "del_announced_route", oldCidrs); err != nil {
+			return err
+		}
+		if err := c.execUpdateBgpRoute(routerPod, "add_announced_route", newCidrs); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) getRouterPods(router *kubeovnv1.VpcEdgeRouter) ([]*corev1.Pod, error) {
+	if len(router.Spec.ParentRefs) == 0 {
+		return nil, fmt.Errorf("no parent references found for VpcEdgeRouter %s/%s",
+			router.Namespace, router.Name)
+	}
+
+	var allPods []*corev1.Pod
+	var lastError error
+
+	for _, parentRef := range router.Spec.ParentRefs {
+		namespace := parentRef.Namespace
+		if namespace == "" {
+			namespace = router.Namespace
+		}
+
+		// List VpcEgressGateway
+		gateway, err := c.vpcEgressGatewayLister.VpcEgressGateways(namespace).Get(parentRef.Name)
+		if err != nil {
+			lastError = err
+			if k8serrors.IsNotFound(err) {
+				klog.Errorf("Referenced VPC Egress Gateway %s/%s not found for router %s/%s",
+					namespace, parentRef.Name, router.Namespace, router.Name)
+			} else {
+				klog.Errorf("Failed to get VPC Egress Gateway %s/%s for router %s/%s: %v",
+					namespace, parentRef.Name, router.Namespace, router.Name, err)
+			}
+			continue
+		}
+
+		// List Pods from Gateway
+		pods, err := c.getPodsFromGateway(gateway)
+		if err != nil {
+			lastError = err
+			klog.Errorf("Failed to get pods from gateway %s/%s: %v",
+				gateway.Namespace, gateway.Name, err)
+			continue
+		}
+
+		// Validate pod, status runnuing
+		for _, pod := range pods {
+			if pod.Status.Phase == corev1.PodRunning {
+				allPods = append(allPods, pod)
+			}
+		}
+	}
+
+	if len(allPods) == 0 {
+		if lastError != nil {
+			return nil, fmt.Errorf("no running pods found for VpcEdgeRouter %s/%s, last error: %w",
+				router.Namespace, router.Name, lastError)
+		}
+		return nil, fmt.Errorf("no running pods found for any parent references of VpcEdgeRouter %s/%s",
+			router.Namespace, router.Name)
+	}
+
+	klog.Infof("Found %d running pods for VpcEdgeRouter %s/%s",
+		len(allPods), router.Namespace, router.Name)
+
+	return allPods, nil
+}
+
+func (c *Controller) getPodsFromGateway(gateway *kubeovnv1.VpcEgressGateway) ([]*corev1.Pod, error) {
+	var pods []*corev1.Pod
+
+	if gateway.Status.Workload.Name != "" {
+		workloadPods, err := c.getPodsFromWorkload(gateway)
+		if err != nil {
+			klog.Warningf("Failed to get pods from workload for gateway %s/%s: %v",
+				gateway.Namespace, gateway.Name, err)
+		} else {
+			pods = append(pods, workloadPods...)
+		}
+	}
+
+	if len(pods) == 0 {
+		labelPods, err := c.getPodsFromLabelSelector(gateway)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get pods using label selector: %w", err)
+		}
+		pods = append(pods, labelPods...)
+	}
+
+	return pods, nil
+}
+
+func (c *Controller) getPodsFromWorkload(gateway *kubeovnv1.VpcEgressGateway) ([]*corev1.Pod, error) {
+	workload := gateway.Status.Workload
+	return c.getPodsFromDeployment(gateway.Namespace, workload.Name)
+}
+
+func (c *Controller) getPodsFromDeployment(namespace, name string) ([]*corev1.Pod, error) {
+	deployment, err := c.deploymentsLister.Deployments(namespace).Get(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get deployment %s/%s: %w", namespace, name, err)
+	}
+
+	// Use the deployment's label selector to find pods
+	selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert label selector: %w", err)
+	}
+
+	pods, err := c.podsLister.Pods(namespace).List(selector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	return pods, nil
+}
+
+func (c *Controller) getPodsFromLabelSelector(gateway *kubeovnv1.VpcEgressGateway) ([]*corev1.Pod, error) {
+	// VPC Egress Gateway label selector
+	labelSelector := labels.SelectorFromSet(labels.Set{
+		"app":                      "vpc-egress-gateway",
+		util.VpcEgressGatewayLabel: gateway.Name,
+	})
+
+	pods, err := c.podsLister.Pods(gateway.Namespace).List(labelSelector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods with label selector: %w", err)
+	}
+
+	return pods, nil
+}
+
+func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, operation string, cidrs []string) error {
+	cmd := fmt.Sprintf("bash /kube-ovn/update-bgp-route.sh %s %s", operation, strings.Join(cidrs, " "))
+	klog.V(3).Info(cmd)
+	stdOutput, errOutput, err := util.ExecuteCommandInContainer(c.config.KubeClient, c.config.KubeRestConfig, pod.Namespace, pod.Name, "vpc-edge-router-speaker", []string{"/bin/bash", "-c", cmd}...)
+	if err != nil {
+		if len(errOutput) > 0 {
+			klog.Errorf("failed to ExecuteCommandInContainer, errOutput: %v", errOutput)
+		}
+		if len(stdOutput) > 0 {
+			klog.V(3).Infof("failed to ExecuteCommandInContainer, stdOutput: %v", stdOutput)
+		}
+		klog.Error(err)
+		return err
+	}
+
+	if len(stdOutput) > 0 {
+		klog.V(3).Infof("ExecuteCommandInContainer stdOutput: %v", stdOutput)
+	}
+
+	if len(errOutput) > 0 {
+		klog.Errorf("failed to ExecuteCommandInContainer errOutput: %v", errOutput)
+		return errors.New(errOutput)
+	}
 	return nil
 }
 
@@ -310,91 +603,6 @@ func (c *Controller) reconcileVpcEdgeRouterBGP(router *kubeovnv1.VpcEdgeRouter) 
 				metav1.PatchOptions{}); err != nil {
 			return fmt.Errorf("failed to strategic-merge-patch Deployment %s/%s: %w", ns, gwName, err)
 		}
-
-		// Already validate vpc egress gateway in validateParentRefs
-		// gw, err := c.vpcEgressGatewayLister.VpcEgressGateways(ns).Get(parent.Name)
-		// if err != nil {
-		// 	return fmt.Errorf("failed to get VpcEgressGateway %s/%s: %w", ns, parent.Name, err)
-		// }
-
-		// Build JSON patch operations
-		// var patchOps []map[string]any
-
-		// 1) Add volume for speaker config
-		// patchOps = append(patchOps, map[string]any{
-		// 	"op":   "add",
-		// 	"path": "/spec/template/spec/volumes/-",
-		// 	"value": corev1.Volume{
-		// 		Name: "bgp-speaker-config",
-		// 		VolumeSource: corev1.VolumeSource{
-		// 			ConfigMap: &corev1.ConfigMapVolumeSource{
-		// 				LocalObjectReference: corev1.LocalObjectReference{
-		// 					Name: gw.Name + "-bgp-speaker-config",
-		// 				},
-		// 			},
-		// 		},
-		// 	},
-		// })
-
-		// ADD LOGIC
-		// bgpSpeakerContainer := &corev1.Container{
-		// 	Name:            "vpc-egress-gw-speaker",
-		// 	Image:           router.Spec.BGP.Image,
-		// 	Command:         []string{"/kube-ovn/kube-ovn-speaker"},
-		// 	ImagePullPolicy: corev1.PullIfNotPresent,
-		// 	Env: []corev1.EnvVar{
-		// 		{
-		// 			Name:  "EGRESS_GATEWAY_NAME",
-		// 			Value: gw.Name,
-		// 		},
-		// 		{
-		// 			Name: "POD_IP",
-		// 			ValueFrom: &corev1.EnvVarSource{
-		// 				FieldRef: &corev1.ObjectFieldSelector{
-		// 					FieldPath: "status.podIP",
-		// 				},
-		// 			},
-		// 		},
-		// 		{
-		// 			Name: "MULTI_NET_STATUS",
-		// 			ValueFrom: &corev1.EnvVarSource{
-		// 				FieldRef: &corev1.ObjectFieldSelector{
-		// 					FieldPath: "metadata.annotations['k8s.v1.cni.cncf.io/networks-status']",
-		// 				},
-		// 			},
-		// 		},
-		// 	},
-		// 	Args: args,
-		// 	// bgp need to add/remove fib, it needs root user
-		// 	SecurityContext: &corev1.SecurityContext{
-		// 		Privileged: ptr.To(false),
-		// 		RunAsUser:  ptr.To[int64](0),
-		// 		Capabilities: &corev1.Capabilities{
-		// 			Add:  []corev1.Capability{"NET_ADMIN", "NET_BIND_SERVICE", "NET_RAW"},
-		// 			Drop: []corev1.Capability{"ALL"},
-		// 		},
-		// 	},
-		// }
-		// // 2) Add the sidecar container with env and securityContext
-		// patchOps = append(patchOps, map[string]any{
-		// 	"op":    "add",
-		// 	"path":  "/spec/template/spec/containers/-",
-		// 	"value": bgpSpeakerContainer,
-		// })
-
-		// // Marshal and apply patch
-		// patchBytes, err := json.Marshal(patchOps)
-		// if err != nil {
-		// 	return fmt.Errorf("failed to marshal patch: %w", err)
-		// }
-		// if _, err := c.config.KubeClient.AppsV1().Deployments(ns).
-		// 	Patch(context.Background(),
-		// 		gw.Status.Workload.Name,
-		// 		types.JSONPatchType,
-		// 		patchBytes,
-		// 		metav1.PatchOptions{}); err != nil {
-		// 	return fmt.Errorf("failed to patch deployment %s/%s: %w", ns, gw.Status.Workload.Name, err)
-		// }
 	}
 
 	// Update VPCEdgeRouter status

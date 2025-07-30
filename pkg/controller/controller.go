@@ -291,11 +291,12 @@ type Controller struct {
 	// Database health check
 	dbFailureCount int
 
-	vpcEdgeRouterLister           kubeovnlister.VpcEdgeRouterLister
-	vpcEdgeRouterSynced           cache.InformerSynced
-	addOrUpdateVpcEdgeRouterQueue workqueue.TypedRateLimitingInterface[string]
-	delVpcEdgeRouterQueue         workqueue.TypedRateLimitingInterface[string]
-	vpcEdgeRouterKeyMutex         keymutex.KeyMutex
+	vpcEdgeRouterLister      kubeovnlister.VpcEdgeRouterLister
+	vpcEdgeRouterSynced      cache.InformerSynced
+	addVpcEdgeRouterQueue    workqueue.TypedRateLimitingInterface[string]
+	updateVpcEdgeRouterQueue workqueue.TypedRateLimitingInterface[string]
+	delVpcEdgeRouterQueue    workqueue.TypedRateLimitingInterface[string]
+	vpcEdgeRouterKeyMutex    keymutex.KeyMutex
 }
 
 func newTypedRateLimitingQueue[T comparable](name string, rateLimiter workqueue.TypedRateLimiter[T]) workqueue.TypedRateLimitingInterface[T] {
@@ -584,11 +585,12 @@ func Run(ctx context.Context, config *Configuration) {
 		kubeovnInformerFactory: kubeovnInformerFactory,
 		anpInformerFactory:     anpInformerFactory,
 
-		vpcEdgeRouterLister:           vpcEdgeRouterInformer.Lister(),
-		vpcEdgeRouterSynced:           vpcEdgeRouterInformer.Informer().HasSynced,
-		addOrUpdateVpcEdgeRouterQueue: newTypedRateLimitingQueue("AddOrUpdateVpcEdgeRouter", custCrdRateLimiter),
-		delVpcEdgeRouterQueue:         newTypedRateLimitingQueue("DeleteVpcEdgeRouter", custCrdRateLimiter),
-		vpcEdgeRouterKeyMutex:         keymutex.NewHashed(numKeyLocks),
+		vpcEdgeRouterLister:      vpcEdgeRouterInformer.Lister(),
+		vpcEdgeRouterSynced:      vpcEdgeRouterInformer.Informer().HasSynced,
+		addVpcEdgeRouterQueue:    newTypedRateLimitingQueue("AddVpcEdgeRouter", custCrdRateLimiter),
+		updateVpcEdgeRouterQueue: newTypedRateLimitingQueue("UpdateVpcEdgeRouter", custCrdRateLimiter),
+		delVpcEdgeRouterQueue:    newTypedRateLimitingQueue("DeleteVpcEdgeRouter", custCrdRateLimiter),
+		vpcEdgeRouterKeyMutex:    keymutex.NewHashed(numKeyLocks),
 	}
 
 	if controller.OVNNbClient, err = ovs.NewOvnNbClient(
@@ -1115,7 +1117,8 @@ func (c *Controller) shutdown() {
 	c.addOrUpdateVpcEgressGatewayQueue.ShutDown()
 	c.delVpcEgressGatewayQueue.ShutDown()
 
-	c.addOrUpdateVpcEdgeRouterQueue.ShutDown()
+	c.addVpcEdgeRouterQueue.ShutDown()
+	c.updateVpcEdgeRouterQueue.ShutDown()
 	c.delVpcEdgeRouterQueue.ShutDown()
 
 	if c.config.EnableLb {
@@ -1211,7 +1214,8 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	go wait.Until(runWorker("delete vpc nat gateway", c.delVpcNatGatewayQueue, c.handleDelVpcNatGw), time.Second, ctx.Done())
 	go wait.Until(runWorker("add/update vpc egress gateway", c.addOrUpdateVpcEgressGatewayQueue, c.handleAddOrUpdateVpcEgressGateway), time.Second, ctx.Done())
 	go wait.Until(runWorker("delete vpc egress gateway", c.delVpcEgressGatewayQueue, c.handleDelVpcEgressGateway), time.Second, ctx.Done())
-	go wait.Until(runWorker("add/update vpc edge router", c.addOrUpdateVpcEdgeRouterQueue, c.handleAddOrUpdateVpcEdgeRouter), time.Second, ctx.Done())
+	go wait.Until(runWorker("add vpc edge router", c.addVpcEdgeRouterQueue, c.handleAddVpcEdgeRouter), time.Second, ctx.Done())
+	go wait.Until(runWorker("update vpc edge router", c.updateVpcEdgeRouterQueue, c.handleUpdateVpcEdgeRouter), time.Second, ctx.Done())
 	go wait.Until(runWorker("delete vpc edge router", c.delVpcEdgeRouterQueue, c.handleDelVpcEdgeRouter), time.Second, ctx.Done())
 	go wait.Until(runWorker("update fip for vpc nat gateway", c.updateVpcFloatingIPQueue, c.handleUpdateVpcFloatingIP), time.Second, ctx.Done())
 	go wait.Until(runWorker("update eip for vpc nat gateway", c.updateVpcEipQueue, c.handleUpdateVpcEip), time.Second, ctx.Done())
