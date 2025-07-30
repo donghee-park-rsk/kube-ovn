@@ -249,10 +249,7 @@ func (c *Controller) updateAdvertisedRoutes(newRouter, oldRouter *kubeovnv1.VpcE
 		return fmt.Errorf("no router pods found for vpc-edge-router %s/%s", newRouter.Namespace, newRouter.Name)
 	}
 	for _, routerPod := range routerPods {
-		if err := c.execUpdateBgpRoute(routerPod, "del_announced_route", oldCidrs); err != nil {
-			return err
-		}
-		if err := c.execUpdateBgpRoute(routerPod, "add_announced_route", newCidrs); err != nil {
+		if err := c.execUpdateBgpRoute(routerPod, oldCidrs, newCidrs); err != nil {
 			return err
 		}
 	}
@@ -385,9 +382,16 @@ func (c *Controller) getPodsFromLabelSelector(gateway *kubeovnv1.VpcEgressGatewa
 	return pods, nil
 }
 
-func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, operation string, cidrs []string) error {
-	cmd := fmt.Sprintf("bash /kube-ovn/update-bgp-route.sh %s %s", operation, strings.Join(cidrs, " "))
-	klog.V(3).Info(cmd)
+func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, delCidrs, addCidrs []string) error {
+	cmdArs := []string{}
+	if len(delCidrs) > 0 {
+		cmdArs = append(cmdArs, "del_announced_route="+strings.Join(delCidrs, ","))
+	}
+	if len(addCidrs) > 0 {
+		cmdArs = append(cmdArs, "add_announced_route="+strings.Join(addCidrs, ","))
+	}
+	cmd := fmt.Sprintf("bash /kube-ovn/update-bgp-route.sh %s", strings.Join(cmdArs, " "))
+	klog.Infof("exec command : %s", cmd)
 	stdOutput, errOutput, err := util.ExecuteCommandInContainer(c.config.KubeClient, c.config.KubeRestConfig, pod.Namespace, pod.Name, "vpc-edge-router-speaker", []string{"/bin/bash", "-c", cmd}...)
 	if err != nil {
 		if len(errOutput) > 0 {
@@ -401,7 +405,7 @@ func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, operation string, cidrs
 	}
 
 	if len(stdOutput) > 0 {
-		klog.V(3).Infof("ExecuteCommandInContainer stdOutput: %v", stdOutput)
+		klog.Infof("ExecuteCommandInContainer stdOutput: %v", stdOutput)
 	}
 
 	if len(errOutput) > 0 {
