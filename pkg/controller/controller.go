@@ -294,7 +294,7 @@ type Controller struct {
 	vpcEdgeRouterLister      kubeovnlister.VpcEdgeRouterLister
 	vpcEdgeRouterSynced      cache.InformerSynced
 	addVpcEdgeRouterQueue    workqueue.TypedRateLimitingInterface[string]
-	updateVpcEdgeRouterQueue workqueue.TypedRateLimitingInterface[string]
+	updateVpcEdgeRouterQueue workqueue.TypedRateLimitingInterface[*updateVerObject]
 	delVpcEdgeRouterQueue    workqueue.TypedRateLimitingInterface[string]
 	vpcEdgeRouterKeyMutex    keymutex.KeyMutex
 }
@@ -588,7 +588,7 @@ func Run(ctx context.Context, config *Configuration) {
 		vpcEdgeRouterLister:      vpcEdgeRouterInformer.Lister(),
 		vpcEdgeRouterSynced:      vpcEdgeRouterInformer.Informer().HasSynced,
 		addVpcEdgeRouterQueue:    newTypedRateLimitingQueue("AddVpcEdgeRouter", custCrdRateLimiter),
-		updateVpcEdgeRouterQueue: newTypedRateLimitingQueue("UpdateVpcEdgeRouter", custCrdRateLimiter),
+		updateVpcEdgeRouterQueue: newTypedRateLimitingQueue[*updateVerObject]("UpdateVpcEdgeRouter", nil),
 		delVpcEdgeRouterQueue:    newTypedRateLimitingQueue("DeleteVpcEdgeRouter", custCrdRateLimiter),
 		vpcEdgeRouterKeyMutex:    keymutex.NewHashed(numKeyLocks),
 	}

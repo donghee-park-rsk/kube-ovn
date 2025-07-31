@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+
 	// "github.com/kubeovn/kube-ovn/pkg/ovs"
 	// "github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -42,21 +43,109 @@ const (
 	LastAppliedConfigAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
 )
 
+type updateVerObject struct {
+	key    string
+	oldVer *kubeovnv1.VpcEdgeRouter
+	newVer *kubeovnv1.VpcEdgeRouter
+}
+
 func (c *Controller) enqueueAddVpcEdgeRouter(obj any) {
 	key := cache.MetaObjectToName(obj.(*kubeovnv1.VpcEdgeRouter)).String()
-	klog.V(3).Infof("enqueue add vpc-edge-router %s", key)
+	klog.Infof("enqueue add vpc-edge-router %s", key)
 	c.addVpcEdgeRouterQueue.Add(key)
 }
 
-func (c *Controller) enqueueUpdateVpcEdgeRouter(_, newObj any) {
+// func (c *Controller) enqueueUpdateVpcEdgeRouter(_, newObj any) {
+// 	key := cache.MetaObjectToName(newObj.(*kubeovnv1.VpcEdgeRouter)).String()
+// 	klog.Infof("enqueue update vpc-edge-router %s", key)
+// 	c.updateVpcEdgeRouterQueue.Add(key)
+// }
+
+func (c *Controller) enqueueUpdateVpcEdgeRouter(oldObj, newObj any) {
 	key := cache.MetaObjectToName(newObj.(*kubeovnv1.VpcEdgeRouter)).String()
-	klog.V(3).Infof("enqueue update vpc-edge-router %s", key)
-	c.updateVpcEdgeRouterQueue.Add(key)
+	klog.Infof("enqueue update vpc-edge-router %s", key)
+	if oldObj == nil {
+		klog.Warningf("enqueue update vpc-edge-router %s, but old object is nil", key)
+		return
+	}
+	oldRouter := oldObj.(*kubeovnv1.VpcEdgeRouter)
+	newRouter := newObj.(*kubeovnv1.VpcEdgeRouter)
+	updateVer := &updateVerObject{
+		key:    key,
+		oldVer: oldRouter,
+		newVer: newRouter,
+	}
+	c.updateVpcEdgeRouterQueue.Add(updateVer)
+}
+
+func (c *Controller) handleUpdateVpcEdgeRouter(updateVerObj *updateVerObject) error {
+	// ---------------------------------------------------------------------
+	// 1. Retrieve latest object state from informer cache
+	// ---------------------------------------------------------------------
+	key := updateVerObj.key
+	ns, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("invalid key %q: %w", key, err)
+	}
+
+	c.vpcEdgeRouterKeyMutex.LockKey(key)
+	defer func() { _ = c.vpcEdgeRouterKeyMutex.UnlockKey(key) }()
+
+	cachedRouter, err := c.vpcEdgeRouterLister.VpcEdgeRouters(ns).Get(name)
+	if err != nil {
+		// The object may have been deleted after being enqueued.
+		if k8serrors.IsNotFound(err) {
+			klog.Error(err)
+			return nil
+		}
+		return err // transient error → retry
+	}
+
+	if !cachedRouter.DeletionTimestamp.IsZero() {
+		c.delVpcEdgeRouterQueue.Add(key)
+		return nil
+	}
+	klog.Infof("reconciling vpc-edge-router %s", key)
+	// Deep copy because we might mutate Status below.
+	curRouter := cachedRouter.DeepCopy()
+
+	oldRouter := updateVerObj.oldVer
+	if oldRouter == nil {
+		klog.Warningf("old router is nil for vpc-edge-router %s, using new version for comparison", key)
+		oldRouter = updateVerObj.newVer
+	}
+
+	// routerIDChanged := oldRouter.Spec.BGP.RouterID != curRouter.Spec.BGP.RouterID
+	klog.Infof("old router advertised routes: %v", oldRouter.Spec.BGP.AdvertisedRoutes)
+	klog.Infof("current router advertised routes: %v", curRouter.Spec.BGP.AdvertisedRoutes)
+	// Check if advertised routes have changed
+	routesChanged := !slices.Equal(
+		oldRouter.Spec.BGP.AdvertisedRoutes,
+		curRouter.Spec.BGP.AdvertisedRoutes,
+	)
+
+	// ---------------------------------------------------------------------
+	// 4. Execute business logic based on the diff outcome
+	// ---------------------------------------------------------------------
+	// if routerIDChanged {
+	// 	if err := c.reconfigureRouterID(curRouter); err != nil {
+	// 		return err
+	// 	}
+	// }
+
+	if routesChanged {
+		if err := c.updateAdvertisedRoutes(curRouter, oldRouter); err != nil {
+			return err
+		}
+	}
+
+	klog.Infof("finished reconciling vpc-edge-router %s", key)
+	return nil
 }
 
 func (c *Controller) enqueueDeleteVpcEdgeRouter(obj any) {
 	key := cache.MetaObjectToName(obj.(*kubeovnv1.VpcEdgeRouter)).String()
-	klog.V(3).Infof("enqueue delete vpc-edge-router %s", key)
+	klog.Infof("enqueue delete vpc-edge-router %s", key)
 	c.delVpcEdgeRouterQueue.Add(key)
 }
 
@@ -125,90 +214,67 @@ func (c *Controller) handleAddVpcEdgeRouter(key string) error {
 	return nil
 }
 
-func (c *Controller) handleUpdateVpcEdgeRouter(key string) error {
-	// ---------------------------------------------------------------------
-	// 1. Retrieve latest object state from informer cache
-	// ---------------------------------------------------------------------
-	ns, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		return fmt.Errorf("invalid key %q: %w", key, err)
-	}
+// func (c *Controller) handleUpdateVpcEdgeRouter(key string) error {
+// 	// ---------------------------------------------------------------------
+// 	// 1. Retrieve latest object state from informer cache
+// 	// ---------------------------------------------------------------------
+// 	ns, name, err := cache.SplitMetaNamespaceKey(key)
+// 	if err != nil {
+// 		return fmt.Errorf("invalid key %q: %w", key, err)
+// 	}
 
-	c.vpcEdgeRouterKeyMutex.LockKey(key)
-	defer func() { _ = c.vpcEdgeRouterKeyMutex.UnlockKey(key) }()
+// 	c.vpcEdgeRouterKeyMutex.LockKey(key)
+// 	defer func() { _ = c.vpcEdgeRouterKeyMutex.UnlockKey(key) }()
 
-	cachedRouter, err := c.vpcEdgeRouterLister.VpcEdgeRouters(ns).Get(name)
-	if err != nil {
-		// The object may have been deleted after being enqueued.
-		if k8serrors.IsNotFound(err) {
-			klog.Error(err)
-			return nil
-		}
-		return err // transient error → retry
-	}
+// 	cachedRouter, err := c.vpcEdgeRouterLister.VpcEdgeRouters(ns).Get(name)
+// 	if err != nil {
+// 		// The object may have been deleted after being enqueued.
+// 		if k8serrors.IsNotFound(err) {
+// 			klog.Error(err)
+// 			return nil
+// 		}
+// 		return err // transient error → retry
+// 	}
 
-	if !cachedRouter.DeletionTimestamp.IsZero() {
-		c.delVpcEdgeRouterQueue.Add(key)
-		return nil
-	}
-	klog.Infof("reconciling vpc-edge-router %s", key)
-	// Deep copy because we might mutate Status below.
-	curRouter := cachedRouter.DeepCopy()
+// 	if !cachedRouter.DeletionTimestamp.IsZero() {
+// 		c.delVpcEdgeRouterQueue.Add(key)
+// 		return nil
+// 	}
+// 	klog.Infof("reconciling vpc-edge-router %s", key)
+// 	// Deep copy because we might mutate Status below.
+// 	curRouter := cachedRouter.DeepCopy()
 
-	// ---------------------------------------------------------------------
-	// 2. Fetch a persisted snapshot of the *previous* spec
-	// ---------------------------------------------------------------------
-	// Robust techniques:
-	//   A. Store last-applied hash in cur.Status.ObservedGeneration or annotation
-	//   B. Maintain an in-memory cache (map[key]specHash) across reconciliations
-	//
-	// For simplicity we hash and compare against Status fields.
-	// ---------------------------------------------------------------------
-	// prevHash := curRouter.Status.LastObservedSpecHash // custom field you add to status
-	// newHash  := hashSpec(curRouter.Spec)              // any stable hash (FNV, xxhash, etc.)
+// 	var oldRouter kubeovnv1.VpcEdgeRouter
+// 	if err := json.Unmarshal([]byte(curRouter.GetAnnotations()[LastAppliedConfigAnnotation]), &oldRouter); err != nil {
+// 		return fmt.Errorf("failed to unmarshal last-applied-configuration: %w", err)
+// 	}
+// 	// routerIDChanged := oldRouter.Spec.BGP.RouterID != curRouter.Spec.BGP.RouterID
+// 	klog.Infof("old router advertised routes: %v", oldRouter.Spec.BGP.AdvertisedRoutes)
+// 	klog.Infof("current router advertised routes: %v", curRouter.Spec.BGP.AdvertisedRoutes)
+// 	// Check if advertised routes have changed
+// 	routesChanged := !slices.Equal(
+// 		oldRouter.Spec.BGP.AdvertisedRoutes,
+// 		curRouter.Spec.BGP.AdvertisedRoutes,
+// 	)
 
-	// if prevHash == newHash {
-	//     // Nothing changed since we last processed; exit early (idempotent reconciliation)
-	//     return nil
-	// }
+// 	// ---------------------------------------------------------------------
+// 	// 4. Execute business logic based on the diff outcome
+// 	// ---------------------------------------------------------------------
+// 	// if routerIDChanged {
+// 	// 	if err := c.reconfigureRouterID(curRouter); err != nil {
+// 	// 		return err
+// 	// 	}
+// 	// }
 
-	// ---------------------------------------------------------------------
-	// 3. Compute fine-grained diffs
-	// ---------------------------------------------------------------------
-	// Load the version we previously processed (you would usually unmarshall
-	// from an annotation or store in Status as JSON). Here we assume a helper:
+// 	if routesChanged {
+// 		if err := c.updateAdvertisedRoutes(curRouter, &oldRouter); err != nil {
+// 			return err
+// 		}
+// 	}
 
-	var oldRouter kubeovnv1.VpcEdgeRouter
-	if err := json.Unmarshal([]byte(curRouter.GetAnnotations()[LastAppliedConfigAnnotation]), &oldRouter); err != nil {
-		return fmt.Errorf("failed to unmarshal last-applied-configuration: %w", err)
-	}
-	// routerIDChanged := oldRouter.Spec.BGP.RouterID != curRouter.Spec.BGP.RouterID
-	klog.Infof("old router advertised routes: %v", oldRouter.Spec.BGP.AdvertisedRoutes)
-	klog.Infof("current router advertised routes: %v", curRouter.Spec.BGP.AdvertisedRoutes)
-	// Check if advertised routes have changed
-	routesChanged := !slices.Equal(
-		oldRouter.Spec.BGP.AdvertisedRoutes,
-		curRouter.Spec.BGP.AdvertisedRoutes,
-	)
-
-	// ---------------------------------------------------------------------
-	// 4. Execute business logic based on the diff outcome
-	// ---------------------------------------------------------------------
-	// if routerIDChanged {
-	// 	if err := c.reconfigureRouterID(curRouter); err != nil {
-	// 		return err
-	// 	}
-	// }
-
-	if routesChanged {
-		if err := c.updateAdvertisedRoutes(curRouter, &oldRouter); err != nil {
-			return err
-		}
-	}
-
-	klog.Infof("finished reconciling vpc-edge-router %s", key)
-	return nil
-}
+// 	klog.Infof("finished reconciling vpc-edge-router %s", key)
+// 	return nil
+// }
 
 // func (c *Controller) reconfigureRouterID(router *kubeovnv1.VpcEdgeRouter) error {
 // 	// 1. Validate new RouterID (must be valid IP, clash-free, etc.)
@@ -382,15 +448,18 @@ func (c *Controller) getPodsFromLabelSelector(gateway *kubeovnv1.VpcEgressGatewa
 	return pods, nil
 }
 
-func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, delCidrs, addCidrs []string) error {
+func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, oldCidrs, newCidrs []string) error {
+	// add_announced_route
 	cmdArs := []string{}
-	if len(delCidrs) > 0 {
-		cmdArs = append(cmdArs, "del_announced_route="+strings.Join(delCidrs, ","))
+	if len(oldCidrs) > 0 {
+		cmdArs = append(cmdArs, "del_announced_route="+strings.Join(oldCidrs, ","))
 	}
-	if len(addCidrs) > 0 {
-		cmdArs = append(cmdArs, "add_announced_route="+strings.Join(addCidrs, ","))
+	if len(newCidrs) > 0 {
+		cmdArs = append(cmdArs, "add_announced_route="+strings.Join(newCidrs, ","))
 	}
+	cmdArs = append(cmdArs, "list_announced_route")
 	cmd := fmt.Sprintf("bash /kube-ovn/update-bgp-route.sh %s", strings.Join(cmdArs, " "))
+
 	klog.Infof("exec command : %s", cmd)
 	stdOutput, errOutput, err := util.ExecuteCommandInContainer(c.config.KubeClient, c.config.KubeRestConfig, pod.Namespace, pod.Name, "vpc-edge-router-speaker", []string{"/bin/bash", "-c", cmd}...)
 	if err != nil {
@@ -398,7 +467,7 @@ func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, delCidrs, addCidrs []st
 			klog.Errorf("failed to ExecuteCommandInContainer, errOutput: %v", errOutput)
 		}
 		if len(stdOutput) > 0 {
-			klog.V(3).Infof("failed to ExecuteCommandInContainer, stdOutput: %v", stdOutput)
+			klog.Infof("failed to ExecuteCommandInContainer, stdOutput: %v", stdOutput)
 		}
 		klog.Error(err)
 		return err
@@ -412,6 +481,9 @@ func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, delCidrs, addCidrs []st
 		klog.Errorf("failed to ExecuteCommandInContainer errOutput: %v", errOutput)
 		return errors.New(errOutput)
 	}
+
+	// list the current rule and check if the routes are updated
+
 	return nil
 }
 
@@ -468,7 +540,7 @@ func (c *Controller) validateParentRefs(router *kubeovnv1.VpcEdgeRouter) error {
 
 func (c *Controller) reconcileVpcEdgeRouterBGP(router *kubeovnv1.VpcEdgeRouter) error {
 	if !router.Spec.BGP.Enabled {
-		klog.V(3).Infof("BGP is disabled for vpc-edge-router %s/%s", router.Namespace, router.Name)
+		klog.Infof("BGP is disabled for vpc-edge-router %s/%s", router.Namespace, router.Name)
 		return nil
 	}
 
