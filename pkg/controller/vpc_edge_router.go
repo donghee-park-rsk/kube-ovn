@@ -406,8 +406,42 @@ func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, oldCidrs, newCidrs []st
 
 	// list the current rule and check if the routes are updated
 	// Parse and validate BGP routes
+	// If not synced, flush all routes and re-add them
+	// Even if the routes are not synced, throw error
 	if err := c.validateBgpRoutes(stdOutput, newCidrs); err != nil {
-		return fmt.Errorf("BGP route validation failed: %w", err)
+		// flush all routes and re-add them
+		klog.Errorf("BGP route validation failed: %v\nflush and add again", err)
+		retryCmdArgs := []string{"flush_announced_route"}
+		if len(newCidrs) > 0 {
+			retryCmdArgs = append(retryCmdArgs, "add_announced_route="+strings.Join(newCidrs, ","))
+		}
+		retryCmdArgs = append(retryCmdArgs, "list_announced_route")
+		retryCmd := fmt.Sprintf("bash /kube-ovn/update-bgp-route.sh %s", strings.Join(retryCmdArgs, " "))
+		klog.Infof("retry command : %s", retryCmd)
+		retryStdOutput, retryErrOutput, err := util.ExecuteCommandInContainer(c.config.KubeClient, c.config.KubeRestConfig, pod.Namespace, pod.Name, "vpc-edge-router-speaker", []string{"/bin/bash", "-c", retryCmd}...)
+		if err != nil {
+			if len(retryErrOutput) > 0 {
+				klog.Errorf("failed to ExecuteCommandInContainer, errOutput: %v", retryErrOutput)
+			}
+			if len(retryStdOutput) > 0 {
+				klog.Infof("failed to ExecuteCommandInContainer, stdOutput: %v", retryStdOutput)
+			}
+			klog.Error(err)
+			return err
+		}
+
+		if len(retryStdOutput) > 0 {
+			klog.Infof("ExecuteCommandInContainer stdOutput: %v", retryStdOutput)
+		}
+
+		if len(retryErrOutput) > 0 {
+			klog.Errorf("failed to ExecuteCommandInContainer errOutput: %v", retryErrOutput)
+			return errors.New(retryErrOutput)
+		}
+		if err := c.validateBgpRoutes(retryStdOutput, newCidrs); err != nil {
+			klog.Errorf("BGP route validation after retry failed: %v", err)
+			return fmt.Errorf("BGP route validation failed: %w", err)
+		}
 	}
 	klog.Infof("BGP routes updated successfully for pod %s/%s", pod.Namespace, pod.Name)
 	return nil
