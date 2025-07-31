@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"regexp"
 	"slices"
+	"sort"
 	"strings"
 
 	// "errors"
@@ -119,7 +121,7 @@ func (c *Controller) handleUpdateVpcEdgeRouter(updateVerObj *updateVerObject) er
 	klog.Infof("old router advertised routes: %v", oldRouter.Spec.BGP.AdvertisedRoutes)
 	klog.Infof("current router advertised routes: %v", curRouter.Spec.BGP.AdvertisedRoutes)
 	// Check if advertised routes have changed
-	routesChanged := !slices.Equal(
+	routesChanged := !slicesEqual(
 		oldRouter.Spec.BGP.AdvertisedRoutes,
 		curRouter.Spec.BGP.AdvertisedRoutes,
 	)
@@ -213,86 +215,6 @@ func (c *Controller) handleAddVpcEdgeRouter(key string) error {
 
 	return nil
 }
-
-// func (c *Controller) handleUpdateVpcEdgeRouter(key string) error {
-// 	// ---------------------------------------------------------------------
-// 	// 1. Retrieve latest object state from informer cache
-// 	// ---------------------------------------------------------------------
-// 	ns, name, err := cache.SplitMetaNamespaceKey(key)
-// 	if err != nil {
-// 		return fmt.Errorf("invalid key %q: %w", key, err)
-// 	}
-
-// 	c.vpcEdgeRouterKeyMutex.LockKey(key)
-// 	defer func() { _ = c.vpcEdgeRouterKeyMutex.UnlockKey(key) }()
-
-// 	cachedRouter, err := c.vpcEdgeRouterLister.VpcEdgeRouters(ns).Get(name)
-// 	if err != nil {
-// 		// The object may have been deleted after being enqueued.
-// 		if k8serrors.IsNotFound(err) {
-// 			klog.Error(err)
-// 			return nil
-// 		}
-// 		return err // transient error → retry
-// 	}
-
-// 	if !cachedRouter.DeletionTimestamp.IsZero() {
-// 		c.delVpcEdgeRouterQueue.Add(key)
-// 		return nil
-// 	}
-// 	klog.Infof("reconciling vpc-edge-router %s", key)
-// 	// Deep copy because we might mutate Status below.
-// 	curRouter := cachedRouter.DeepCopy()
-
-// 	var oldRouter kubeovnv1.VpcEdgeRouter
-// 	if err := json.Unmarshal([]byte(curRouter.GetAnnotations()[LastAppliedConfigAnnotation]), &oldRouter); err != nil {
-// 		return fmt.Errorf("failed to unmarshal last-applied-configuration: %w", err)
-// 	}
-// 	// routerIDChanged := oldRouter.Spec.BGP.RouterID != curRouter.Spec.BGP.RouterID
-// 	klog.Infof("old router advertised routes: %v", oldRouter.Spec.BGP.AdvertisedRoutes)
-// 	klog.Infof("current router advertised routes: %v", curRouter.Spec.BGP.AdvertisedRoutes)
-// 	// Check if advertised routes have changed
-// 	routesChanged := !slices.Equal(
-// 		oldRouter.Spec.BGP.AdvertisedRoutes,
-// 		curRouter.Spec.BGP.AdvertisedRoutes,
-// 	)
-
-// 	// ---------------------------------------------------------------------
-// 	// 4. Execute business logic based on the diff outcome
-// 	// ---------------------------------------------------------------------
-// 	// if routerIDChanged {
-// 	// 	if err := c.reconfigureRouterID(curRouter); err != nil {
-// 	// 		return err
-// 	// 	}
-// 	// }
-
-// 	if routesChanged {
-// 		if err := c.updateAdvertisedRoutes(curRouter, &oldRouter); err != nil {
-// 			return err
-// 		}
-// 	}
-
-// 	klog.Infof("finished reconciling vpc-edge-router %s", key)
-// 	return nil
-// }
-
-// func (c *Controller) reconfigureRouterID(router *kubeovnv1.VpcEdgeRouter) error {
-// 	// 1. Validate new RouterID (must be valid IP, clash-free, etc.)
-// 	if net.ParseIP(router.Spec.BGP.RouterID) == nil {
-// 		return fmt.Errorf("invalid routerId %q", router.Spec.BGP.RouterID)
-// 	}
-
-// 	// // 2. Push config to BGP speaker (e.g., FRR, GoBGP)
-// 	// if err := c.bgpManager.SetRouterID(router.Namespace, router.Name, router.Spec.BGP.RouterID); err != nil {
-// 	// 	return err
-// 	// }
-
-// 	// // 3. Emit event
-// 	// c.recorder.Event(er, corev1.EventTypeNormal, "RouterIDUpdated",
-// 	// 	fmt.Sprintf("Set router-id=%s", er.Spec.Bgp.RouterId))
-
-// 	return nil
-// }
 
 func (c *Controller) updateAdvertisedRoutes(newRouter, oldRouter *kubeovnv1.VpcEdgeRouter) error {
 	newCidrs := newRouter.Spec.BGP.AdvertisedRoutes
@@ -483,7 +405,11 @@ func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, oldCidrs, newCidrs []st
 	}
 
 	// list the current rule and check if the routes are updated
-
+	// Parse and validate BGP routes
+	if err := c.validateBgpRoutes(stdOutput, newCidrs); err != nil {
+		return fmt.Errorf("BGP route validation failed: %w", err)
+	}
+	klog.Infof("BGP routes updated successfully for pod %s/%s", pod.Namespace, pod.Name)
 	return nil
 }
 
@@ -780,4 +706,94 @@ func (c *Controller) handleDelVpcEdgeRouter(key string) error {
 	}
 
 	return nil
+}
+
+// validateBgpRoutes parses the BGP output which is listing the bgp announced routes and compares with expected newCidrs
+func (c *Controller) validateBgpRoutes(output string, expectedCidrs []string) error {
+	announcedRoutes, err := c.parseBgpAnnouncedRoutes(output)
+	if err != nil {
+		return fmt.Errorf("failed to parse BGP routes: %w", err)
+	}
+
+	// Sort both slices for comparison
+	sort.Strings(announcedRoutes)
+	sort.Strings(expectedCidrs)
+
+	// Compare the routes
+	if !slicesEqual(announcedRoutes, expectedCidrs) {
+		klog.Warningf("BGP route mismatch - Expected: %v, Announced: %v", expectedCidrs, announcedRoutes)
+		return fmt.Errorf("announced routes %v do not match expected routes %v", announcedRoutes, expectedCidrs)
+	}
+
+	klog.Infof("BGP routes successfully validated - Expected and announced routes match: %v", announcedRoutes)
+	return nil
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Create copies and sort them
+	aCopy := make([]string, len(a))
+	bCopy := make([]string, len(b))
+	copy(aCopy, a)
+	copy(bCopy, b)
+
+	sort.Strings(aCopy)
+	sort.Strings(bCopy)
+
+	return slices.Equal(aCopy, bCopy)
+}
+
+func (c *Controller) parseBgpAnnouncedRoutes(output string) ([]string, error) {
+	var routes []string
+
+	// Look for the specific section with next-hop routes
+	lines := strings.Split(output, "\n")
+	inTargetSection := false
+	foundRoutesSection := false
+
+	// Regex to match route lines starting with "*>" followed by CIDR
+	routeRegex := regexp.MustCompile(`^\*>\s+(\d+\.\d+\.\d+\.\d+/\d+)`)
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		// Start parsing when we find the target section with any IP address
+		if strings.Contains(line, "--- Routes with Next-Hop") && strings.Contains(line, "---") {
+			inTargetSection = true
+			continue
+		}
+
+		// Look for the IPv4 routes subsection
+		if inTargetSection && strings.Contains(line, "IPv4 routes with next-hop") {
+			foundRoutesSection = true
+			continue
+		}
+
+		// Stop parsing if we hit another section starting with "---" or "==="
+		if inTargetSection && foundRoutesSection && (strings.HasPrefix(line, "---") || strings.HasPrefix(line, "===")) {
+			break
+		}
+
+		// Skip header lines (Network, Next Hop, AS_PATH, etc.)
+		if inTargetSection && (strings.Contains(line, "Network") && strings.Contains(line, "Next Hop")) {
+			continue
+		}
+
+		// Parse route lines in the target section that start with "*>"
+		if inTargetSection && foundRoutesSection && routeRegex.MatchString(line) {
+			matches := routeRegex.FindStringSubmatch(line)
+			if len(matches) > 1 {
+				routes = append(routes, matches[1])
+			}
+		}
+	}
+
+	if len(routes) == 0 {
+		return nil, errors.New("no announced routes found in BGP output")
+	}
+
+	return routes, nil
 }
