@@ -1217,6 +1217,8 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	go wait.Until(runWorker("add vpc edge router", c.addVpcEdgeRouterQueue, c.handleAddVpcEdgeRouter), time.Second, ctx.Done())
 	go wait.Until(runWorker("update vpc edge router", c.updateVpcEdgeRouterQueue, c.handleUpdateVpcEdgeRouter), time.Second, ctx.Done())
 	go wait.Until(runWorker("delete vpc edge router", c.delVpcEdgeRouterQueue, c.handleDelVpcEdgeRouter), time.Second, ctx.Done())
+	// TODO resync vpc edge router
+	go wait.Until(c.resyncVpcEdgeRouter, 60*time.Second, ctx.Done())
 	go wait.Until(runWorker("update fip for vpc nat gateway", c.updateVpcFloatingIPQueue, c.handleUpdateVpcFloatingIP), time.Second, ctx.Done())
 	go wait.Until(runWorker("update eip for vpc nat gateway", c.updateVpcEipQueue, c.handleUpdateVpcEip), time.Second, ctx.Done())
 	go wait.Until(runWorker("update dnat for vpc nat gateway", c.updateVpcDnatQueue, c.handleUpdateVpcDnat), time.Second, ctx.Done())

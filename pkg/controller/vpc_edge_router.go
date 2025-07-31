@@ -51,6 +51,25 @@ type updateVerObject struct {
 	newVer *kubeovnv1.VpcEdgeRouter
 }
 
+func (c *Controller) resyncVpcEdgeRouter() {
+	klog.Info("resync vpc edge router")
+	// resync all vpc edge routers
+	vpcEdgeRouters, err := c.vpcEdgeRouterLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list vpc edge routers: %v", err)
+		return
+	}
+
+	for _, router := range vpcEdgeRouters {
+		// Check router.Spec.BGP.AdvertisedRoutes same with pods bgp advertised routes
+		if err := c.syncAdvertisedRoutes(router); err != nil {
+			klog.Errorf("failed to sync advertised routes for vpc edge router %s: %v", router.Name, err)
+			continue
+		}
+		klog.Infof("resync vpc edge router %s", router.Name)
+	}
+}
+
 func (c *Controller) enqueueAddVpcEdgeRouter(obj any) {
 	key := cache.MetaObjectToName(obj.(*kubeovnv1.VpcEdgeRouter)).String()
 	klog.Infof("enqueue add vpc-edge-router %s", key)
@@ -216,6 +235,48 @@ func (c *Controller) handleAddVpcEdgeRouter(key string) error {
 	return nil
 }
 
+func (c *Controller) syncAdvertisedRoutes(router *kubeovnv1.VpcEdgeRouter) error {
+	key := cache.MetaObjectToName(router).String()
+
+	c.vpcEdgeRouterKeyMutex.LockKey(key)
+	defer func() { _ = c.vpcEdgeRouterKeyMutex.UnlockKey(key) }()
+
+	if !router.DeletionTimestamp.IsZero() {
+		c.delVpcEdgeRouterQueue.Add(key)
+		return nil
+	}
+	klog.Infof("reconciling vpc-edge-router %s", key)
+	// Deep copy because we might mutate Status below.
+	curRouter := router.DeepCopy()
+	routerCidr := curRouter.Spec.BGP.AdvertisedRoutes
+
+	routerPods, routerErr := c.getRouterPods(curRouter)
+	if routerErr != nil {
+		return fmt.Errorf("failed to get router pods for vpc-edge-router %s/%s: %w", curRouter.Namespace, curRouter.Name, routerErr)
+	}
+	if len(routerPods) == 0 {
+		return fmt.Errorf("no router pods found for vpc-edge-router %s/%s", curRouter.Namespace, curRouter.Name)
+	}
+	for _, routerPod := range routerPods {
+		podCidr, err := c.execGetBgpRoute(routerPod)
+		if err != nil {
+			return err
+		}
+		klog.Infof("current router advertised routes: %v", curRouter.Spec.BGP.AdvertisedRoutes)
+		klog.Infof("router pod %s/%s advertised routes: %v", routerPod.Namespace, routerPod.Name, podCidr)
+		routesDiff := !slicesEqual(podCidr, routerCidr)
+		if routesDiff {
+			if err := c.execUpdateBgpRoute(routerPod, podCidr, routerCidr); err != nil {
+				return err
+			}
+			klog.Infof("synced advertised routes for vpc-edge-router %s pod %s/%s", key, routerPod.Namespace, routerPod.Name)
+		}
+	}
+
+	klog.Infof("finished sync vpc-edge-router %s advertised routes", key)
+	return nil
+}
+
 func (c *Controller) updateAdvertisedRoutes(newRouter, oldRouter *kubeovnv1.VpcEdgeRouter) error {
 	newCidrs := newRouter.Spec.BGP.AdvertisedRoutes
 	oldCidrs := oldRouter.Spec.BGP.AdvertisedRoutes
@@ -368,6 +429,36 @@ func (c *Controller) getPodsFromLabelSelector(gateway *kubeovnv1.VpcEgressGatewa
 	}
 
 	return pods, nil
+}
+
+func (c *Controller) execGetBgpRoute(routerPod *corev1.Pod) ([]string, error) {
+	cmd := "bash /kube-ovn/update-bgp-route.sh list_announced_route"
+	klog.Infof("exec command : %s", cmd)
+	stdOutput, errOutput, err := util.ExecuteCommandInContainer(c.config.KubeClient, c.config.KubeRestConfig, routerPod.Namespace, routerPod.Name, "vpc-edge-router-speaker", []string{"/bin/bash", "-c", cmd}...)
+	if err != nil {
+		if len(errOutput) > 0 {
+			klog.Errorf("failed to ExecuteCommandInContainer, errOutput: %v", errOutput)
+		}
+		klog.Error(err)
+		return nil, err
+	}
+
+	if len(stdOutput) > 0 {
+		klog.Infof("ExecuteCommandInContainer stdOutput: %v", stdOutput)
+	}
+	if len(errOutput) > 0 {
+		klog.Errorf("failed to ExecuteCommandInContainer errOutput: %v", errOutput)
+		return nil, errors.New(errOutput)
+	}
+
+	// Parse the output to extract announced routes
+	announcedRoutes, err := c.parseBgpAnnouncedRoutes(stdOutput)
+	if err != nil {
+		klog.Errorf("failed to parse BGP announced routes: %v", err)
+		return nil, err
+	}
+
+	return announcedRoutes, nil
 }
 
 func (c *Controller) execUpdateBgpRoute(pod *corev1.Pod, oldCidrs, newCidrs []string) error {
