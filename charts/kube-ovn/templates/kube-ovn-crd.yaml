@@ -1340,46 +1340,100 @@ spec:
                       # - format: ipv4
                       # - format: ipv6
                       # - pattern: '^$'
-          # status:
-          #   type: object
-          #   properties:
-          #     conditions:
-          #       type: array
-          #       items:
-          #         type: object
-          #         properties:
-          #           type:
-          #             type: string
-          #           status:
-          #             type: string
-          #             enum: ["True", "False", "Unknown"]
-          #           reason:
-          #             type: string
-          #           message:
-          #             type: string
-          #           lastTransitionTime:
-          #             type: string
-          #             format: date-time
-          #     bgpStatus:
-          #       type: object
-          #       properties:
-          #         sessionState:
-          #           type: string
-          #         peersStatus:
-          #           type: array
-          #           items:
-          #             type: object
-          #             properties:
-          #               address:
-          #                 type: string
-          #               state:
-          #                 type: string
-          #               uptime:
-          #                 type: string
-          #               receivedRoutes:
-          #                 type: integer
-          #               advertisedRoutes:
-          #                 type: integer
+          status:
+            type: object
+            properties:
+              conditions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      description: "Type of condition (e.g., Ready, Available, Progressing)"
+                    status:
+                      type: string
+                      enum: ["True", "False", "Unknown"]
+                      description: "Status of the condition"
+                    reason:
+                      type: string
+                      description: "One-word CamelCase reason for the condition's last transition"
+                    message:
+                      type: string
+                      description: "Human-readable message indicating details about last transition"
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
+                      description: "Last time the condition transitioned from one status to another"
+                    observedGeneration:
+                      type: integer
+                      format: int64
+                      description: "Generation of the resource that was last observed"
+                  required:
+                  - type
+                  - status
+                  - lastTransitionTime
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+                description: "Conditions represent the latest available observations of the VPC Edge Router state"
+              bgpStatus:
+                type: object
+                properties:
+                  sessionState:
+                    type: string
+                    enum: ["Idle", "Connect", "Active", "OpenSent", "OpenConfirm", "Established"]
+                    description: "Overall BGP session state"
+                  peersStatus:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        address:
+                          type: string
+                          anyOf:
+                            - format: ipv4
+                            - format: ipv6
+                          description: "IP address of the BGP peer"
+                        state:
+                          type: string
+                          enum: ["Idle", "Connect", "Active", "OpenSent", "OpenConfirm", "Established"]
+                          description: "BGP session state with this peer"
+                        uptime:
+                          type: string
+                          pattern: '^([0-9]+(\.[0-9]*)?|\.[0-9]+)([munµ]?s|m|h|d)$'
+                          description: "How long the session has been up"
+                        receivedRoutes:
+                          type: integer
+                          minimum: 0
+                          description: "Number of routes received from this peer"
+                        advertisedRoutes:
+                          type: integer
+                          minimum: 0
+                          description: "Number of routes advertised to this peer"
+                      required:
+                      - address
+                      - state
+                    x-kubernetes-list-map-keys:
+                    - address
+                    x-kubernetes-list-type: map
+                    description: "Status of individual BGP peers"
+    additionalPrinterColumns:
+    - name: BGP-Enabled
+      type: boolean
+      description: Whether BGP is enabled
+      jsonPath: .spec.bgp.enabled
+    - name: ASN
+      type: integer
+      description: BGP Autonomous System Number
+      jsonPath: .spec.bgp.asn
+    - name: Session-State
+      type: string
+      description: BGP session state
+      jsonPath: .status.bgpStatus.sessionState
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
