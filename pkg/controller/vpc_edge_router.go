@@ -270,6 +270,7 @@ func (c *Controller) syncAdvertisedRoutes(router *kubeovnv1.VpcEdgeRouter) error
 				return err
 			}
 			klog.Infof("synced advertised routes for vpc-edge-router %s pod %s/%s", key, routerPod.Namespace, routerPod.Name)
+			c.recorder.Eventf(curRouter, corev1.EventTypeNormal, "AdvertisedRoutesSynced", "synced advertised routes for pod %s/%s", routerPod.Namespace, routerPod.Name)
 		}
 	}
 
